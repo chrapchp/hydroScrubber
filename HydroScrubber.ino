@@ -41,6 +41,7 @@
 #define PROCESS_MODBUS
 // refresh intervals
 #define POLL_CYCLE_SECONDS 2 // sonar and 1-wire refresh rate
+#define SPEED_CALC_RATE 1 // every second
 
 
 
@@ -56,11 +57,20 @@ volatile unsigned long timeOn = 0 ;
 volatile unsigned long timeOff = 0;
 
 
+#define FAN_SPEED_INTERUPT 2 
+#define ENABLE_SPEED_SENSOR_INTERRUPTS attachInterrupt(digitalPinToInterrupt(FAN_SPEED_INTERUPT), onB1R1_1A_ST_002_PulseIn, RISING)
+#define DISABLE_SPEED_SENSOR_INTERRUPTS detachInterrupt(digitalPinToInterrupt(FAN_SPEED_INTERUPT))
+
+volatile unsigned int B1R1_1A_ST_002_Raw = 0;
+volatile unsigned int B1R1_1A_ST_002 = 0; // sent to host
+
 // 
 // 
 // /#define FAN_SPEED_INTERUPT   2 // pin does not work return 0 for now to host
 
 #define HUMIDITY_INTAKE_FEED 9 // pin
+
+
 
 
 // DHT-22 - one wire type humidity sensor (won't work with one wire lib)
@@ -78,7 +88,7 @@ DA_AnalogInput B1R1_1A_PDT_003 = DA_AnalogInput(A3, 0.0, 1023.); // min max
 unsigned short B1R1_1A_SY_002 = 0; // current duty cycle to write to fan
 
 
-DA_DiscreteOutput B1R1_1A_XY_001 = DA_DiscreteOutput(12, HIGH); // V1
+DA_DiscreteOutput B1R1_1A_XY_025 = DA_DiscreteOutput(12, HIGH); // V1
 
 
 // HEARTBEAT
@@ -87,12 +97,17 @@ unsigned int heartBeat = 0;
 
 // poll I/O every 2 seconds
 DA_NonBlockingDelay pollTimer = DA_NonBlockingDelay( POLL_CYCLE_SECONDS*1000, &doOnPoll);
-
+DA_NonBlockingDelay speedSampleTimer = DA_NonBlockingDelay( SPEED_CALC_RATE*1000, &doOnSpeedCalc);
 
 
 #ifdef PROCESS_TERMINAL
 HardwareSerial *tracePort = &Serial;
 #endif
+
+void onB1R1_1A_ST_002_PulseIn()
+{
+  B1R1_1A_ST_002_Raw++;
+}
 
 
 void on_B1R1_1A_AT_001_Rising()
@@ -127,7 +142,7 @@ void setup()
   slave.begin(MB_SPEED);
 #endif
 
-  pinMode(B1R1_1A_SY_002, OUTPUT);
+  pinMode(B1R1_1A_SY_002_PIN, OUTPUT);
   randomSeed(analogRead(3));
 
 ENABLE_CO2_SENSOR_RISING_INTERRUPTS;
@@ -146,6 +161,7 @@ void loop()
   processModbusCommands();
 #endif
   pollTimer.refresh();
+  speedSampleTimer.refresh();
 
 
 
@@ -167,7 +183,17 @@ void doOnPoll()
   heartBeat++;
 }
 
+void doOnSpeedCalc()
+{
 
+
+  DISABLE_SPEED_SENSOR_INTERRUPTS;
+  B1R1_1A_ST_002 = B1R1_1A_ST_002_Raw;
+  B1R1_1A_ST_002_Raw = 0;
+  ENABLE_SPEED_SENSOR_INTERRUPTS;
+
+  // resetTotalizers();
+}
 
 void doReadAnalogs()
 {
@@ -201,13 +227,63 @@ void refreshModbusRegisters()
 
 
   //modbusRegisters[HR_FLOW1] = B1R1_1A_FT_001.getCurrentPulses();
-  modbusRegisters[B1R1_1A_ST_002_MB] =  -1; // not implemented
+  modbusRegisters[B1R1_1A_ST_002_MB] =  B1R1_1A_ST_002;
     modbusRegisters[HEART_BEAT] = heartBeat;
 modbusRegisters[B1R1_1A_AT_001_MB] =  ( 2000 * ( timeOn - .002)/(timeOn+timeOff - .004) ) * 10;
 
 
 }
 
+bool getModbusCoilValue(unsigned short startAddress, unsigned short bitPos)
+{
+  // *tracePort << "reading at " << startAddress << " bit offset " << bitPos << "value=" << bitRead(modbusRegisters[startAddress + (int)(bitPos / 16)], bitPos % 16 ) << endl;
+  return(bitRead(modbusRegisters[startAddress + (int) (bitPos / 16)], bitPos % 16));
+}
+
+void writeModbusCoil(unsigned short startAddress, unsigned short bitPos, bool value)
+{
+  bitWrite(modbusRegisters[startAddress + (int) (bitPos / 16)], bitPos % 16, value);
+}
+
+void checkAndActivateDO(unsigned int bitOffset, DA_DiscreteOutput * aDO)
+{
+  // look for a change from 0 to 1
+  if (getModbusCoilValue(COIL_STATUS_READ_WRITE_OFFSET, bitOffset))
+  {
+    aDO->activate();
+
+  #ifdef TRACE_MODBUS_COILS
+    *tracePort << "Activate DO:";
+    aDO->serialize(tracePort, true);
+   // LED.activate();
+  #endif
+
+   // writeModbusCoil(COIL_STATUS_READ_WRITE_OFFSET, bitOffset, false); // clear the bit
+  }
+}
+
+void checkAndResetDO(unsigned int bitOffset, DA_DiscreteOutput * aDO)
+{
+  // look for a change from 0 to 1
+  if (!getModbusCoilValue(COIL_STATUS_READ_WRITE_OFFSET, bitOffset))
+  {
+    aDO->reset();
+
+  #ifdef TRACE_MODBUS_COILS
+    *tracePort << "Reset DO:";
+    aDO->serialize(tracePort, true);
+    //LED.reset();
+  #endif
+
+   // writeModbusCoil(COIL_STATUS_READ_WRITE_OFFSET, bitOffset, false); // clear the bit
+  }
+}
+void processValveCommands()
+
+{
+  checkAndActivateDO(VALVE1_OPEN_CLOSE, &B1R1_1A_XY_025);
+  checkAndResetDO(VALVE1_OPEN_CLOSE, &B1R1_1A_XY_025);
+}
 
 void processSetFanSpeedCommand()
 {
@@ -219,7 +295,7 @@ void processSetFanSpeedCommand()
 
 void processModbusCommands()
 {
-
+  processValveCommands();
   processSetFanSpeedCommand();
 }
 
